@@ -1,11 +1,16 @@
 """
-CH03 — checkpointing + multi-turn + time travel.
+CH04 — streaming.
 
-Compiles the CH02 graph with an `InMemorySaver`. Every node boundary
-auto-saves a state snapshot, keyed by `thread_id`. The REPL keeps one
-`thread_id` across turns -> multi-turn falls out for free. Slash
-commands let you inspect history and fork from any historical
-checkpoint.
+Same graph as CH03 (llm + tools + checkpointer). The only change is how we
+consume the output: instead of `invoke()` blocking until the whole graph
+finishes, we use `stream()` / `astream_events()` to surface intermediate
+events. The REPL exposes a `/mode` slash command so you can swap between:
+
+    updates    — one chunk per node, only the channel diff (default)
+    values     — full state after each step
+    messages   — LLM tokens stream out live (typing animation)
+    debug      — every internal event (task start/end, checkpoint writes)
+    events     — astream_events v2: per-LLM-token + per-tool start/end
 
 Run:
     pip install -r requirements.txt
@@ -13,6 +18,7 @@ Run:
     python agent.py
 """
 
+import asyncio
 import hashlib
 import json
 import random
@@ -36,11 +42,11 @@ load_dotenv(override=True)
 
 
 class State(TypedDict):
-    """Same shape as CH01 / CH02 — checkpointing doesn't change State."""
+    """Same shape as CH01-CH03 — streaming doesn't change State."""
     messages: Annotated[list, add_messages]
 
 
-# ---------- Tools (same as CH02) ----------------------------------------------
+# ---------- Tools (same as CH02/CH03) -----------------------------------------
 
 @tool(parse_docstring=True)
 def get_price_data(ticker: str, days: int = 30) -> str:
@@ -80,7 +86,7 @@ def compute_sma(prices: list[float], window: int) -> str:
 TOOLS = [get_price_data, compute_sma]
 
 
-# ---------- Model + nodes (same as CH02) --------------------------------------
+# ---------- Model + nodes (same as CH02/CH03) ---------------------------------
 
 llm = ChatAnthropic(model="claude-sonnet-4-6", max_tokens=1024).bind_tools(TOOLS)
 
@@ -92,9 +98,7 @@ def llm_node(state: State) -> dict:
 tool_node = ToolNode(TOOLS)
 
 
-# ---------- Graph + checkpointer ----------------------------------------------
-# The graph topology is identical to CH02. The only new thing is
-# `checkpointer=...` on compile().
+# ---------- Graph + checkpointer (same as CH03) -------------------------------
 
 graph = StateGraph(State)
 graph.add_node("llm", llm_node)
@@ -109,23 +113,22 @@ agent = graph.compile(checkpointer=checkpointer)
 print(agent.get_graph().draw_mermaid())
 
 
-# ---------- REPL helpers ------------------------------------------------------
+# ---------- Stream-mode formatters --------------------------------------------
+
+STREAM_MODES = ("updates", "values", "messages", "debug", "events")
+
 
 def _short(cid: str | None, n: int = 8) -> str:
-    """Last `n` chars of a checkpoint UUIDv6 — the random/sequence tail.
-    The first segment is a millisecond-precision timestamp, so adjacent
-    checkpoints collide there; the tail is what distinguishes them."""
     if not cid:
         return "?"
     return cid[-n:]
 
 
 def _summarize_msg(m) -> str:
-    """One-line label for a message, used in history listings."""
     kind = m.__class__.__name__
     if kind == "HumanMessage":
         return f"user: {m.content[:40]}"
-    if kind == "AIMessage":
+    if kind in ("AIMessage", "AIMessageChunk"):
         tool_calls = getattr(m, "tool_calls", None) or []
         if tool_calls:
             names = ", ".join(tc["name"] for tc in tool_calls)
@@ -136,6 +139,119 @@ def _summarize_msg(m) -> str:
         return f"tool: {m.name} -> {str(m.content)[:30]}"
     return f"{kind}: ..."
 
+
+def _stream_sync(user_in: str, config: dict, mode: str) -> None:
+    """stream_mode in {updates, values, messages, debug}."""
+    payload = {"messages": [{"role": "user", "content": user_in}]}
+    step = 0
+
+    for chunk in agent.stream(payload, config=config, stream_mode=mode):
+        step += 1
+
+        if mode == "updates":
+            # chunk: {node_name: {channel: diff}}
+            for node, diff in chunk.items():
+                for m in diff.get("messages", []):
+                    print(f"[{step:>2}] [{node:>5}] {_summarize_msg(m)}")
+
+        elif mode == "values":
+            # chunk: full state dict (after this step)
+            msgs = chunk.get("messages", [])
+            last = _summarize_msg(msgs[-1]) if msgs else "-"
+            print(f"[{step:>2}] [values] msgs={len(msgs):<2} last={last}")
+
+        elif mode == "messages":
+            # chunk: (BaseMessageChunk, metadata)
+            msg_chunk, meta = chunk
+            node = meta.get("langgraph_node", "?")
+            kind = msg_chunk.__class__.__name__
+
+            if kind in ("AIMessageChunk", "AIMessage"):
+                content = msg_chunk.content
+                if isinstance(content, str):
+                    if content:
+                        print(content, end="", flush=True)
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            print(block.get("text", ""), end="", flush=True)
+                for tc in getattr(msg_chunk, "tool_call_chunks", []) or []:
+                    if tc.get("name"):
+                        print(f"\n[tool_call] {tc['name']} args=", end="", flush=True)
+                    if tc.get("args"):
+                        print(tc["args"], end="", flush=True)
+            elif kind == "ToolMessage":
+                content = str(msg_chunk.content)
+                preview = content if len(content) <= 100 else content[:100] + "..."
+                print(f"\n[tool_res ] {msg_chunk.name} -> {preview}")
+
+        elif mode == "debug":
+            kind = chunk.get("type", "?")
+            step_n = chunk.get("step", "?")
+            payload_inner = chunk.get("payload", {})
+            name = payload_inner.get("name", "")
+            print(f"[{step:>3}] [debug] type={kind:<13} step={step_n}  name={name}")
+
+    if mode == "messages":
+        print()  # final newline after token stream
+
+
+async def _stream_events(user_in: str, config: dict) -> None:
+    """astream_events v2 — finer than stream_mode='messages': also gives
+    on_tool_start / on_tool_end / on_chain_* / on_chat_model_start, etc."""
+    payload = {"messages": [{"role": "user", "content": user_in}]}
+    streaming_text = False
+
+    async for ev in agent.astream_events(payload, config=config, version="v2"):
+        kind = ev["event"]
+        name = ev.get("name", "")
+        data = ev.get("data", {})
+
+        if kind == "on_chat_model_start":
+            print(f"\n[event] on_chat_model_start  name={name}")
+            streaming_text = False
+        elif kind == "on_chat_model_stream":
+            chunk = data.get("chunk")
+            if not chunk:
+                continue
+            content = chunk.content
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text += block.get("text", "")
+            if text:
+                if not streaming_text:
+                    print("[event] on_chat_model_stream  ", end="", flush=True)
+                    streaming_text = True
+                print(text, end="", flush=True)
+        elif kind == "on_chat_model_end":
+            if streaming_text:
+                print()
+                streaming_text = False
+            print(f"[event] on_chat_model_end    name={name}")
+        elif kind == "on_tool_start":
+            print(f"[event] on_tool_start        name={name}  input={data.get('input')}")
+        elif kind == "on_tool_end":
+            output_obj = data.get("output")
+            output_str = str(getattr(output_obj, "content", output_obj))
+            preview = output_str if len(output_str) <= 80 else output_str[:80] + "..."
+            print(f"[event] on_tool_end          name={name}  output={preview}")
+
+    if streaming_text:
+        print()
+
+
+def _run_turn(user_in: str, config: dict, mode: str) -> None:
+    if mode == "events":
+        asyncio.run(_stream_events(user_in, config))
+    else:
+        _stream_sync(user_in, config, mode)
+
+
+# ---------- REPL helpers (same as CH03) ---------------------------------------
 
 def _print_history(thread_id: str) -> None:
     config = {"configurable": {"thread_id": thread_id}}
@@ -154,28 +270,6 @@ def _print_history(thread_id: str) -> None:
     print()
 
 
-def _print_new_messages(prev_count: int, full_messages: list) -> None:
-    """Print only messages added in the last invoke (so multi-turn isn't noisy)."""
-    for m in full_messages[prev_count:]:
-        kind = m.__class__.__name__
-        if kind == "HumanMessage":
-            print(f"[user]      {m.content}")
-        elif kind == "AIMessage":
-            if isinstance(m.content, str):
-                if m.content.strip():
-                    print(f"[assistant] {m.content}")
-            else:
-                for block in m.content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        print(f"[assistant] {block['text']}")
-            for tc in getattr(m, "tool_calls", []) or []:
-                print(f"[tool_call] {tc['name']}({tc['args']})")
-        elif kind == "ToolMessage":
-            content = str(m.content)
-            preview = content if len(content) <= 120 else content[:120] + "..."
-            print(f"[tool_res]  {m.name} -> {preview}")
-
-
 def _new_thread_id() -> str:
     return "demo-" + uuid.uuid4().hex[:6]
 
@@ -185,11 +279,15 @@ def _new_thread_id() -> str:
 if __name__ == "__main__":
     thread_id = _new_thread_id()
     pending_fork_prefix: str | None = None
+    current_mode = "updates"
 
-    print("[init] CH03 — checkpointing + multi-turn + time travel")
-    print(f"[init] thread_id = {thread_id}")
+    print("[init] CH04 — streaming")
+    print(f"[init] thread_id   = {thread_id}")
+    print(f"[init] stream mode = {current_mode}  (try /mode for others)")
     print("[hint] commands:")
-    print("       /new          start a fresh thread (new conversation)")
+    print("       /mode [name]  show or switch stream mode")
+    print(f"                     options: {', '.join(STREAM_MODES)}")
+    print("       /new          start a fresh thread")
     print("       /history      list checkpoints for the current thread")
     print("       /fork <ckpt>  next message replays from that checkpoint")
     print("       /exit         quit")
@@ -197,7 +295,9 @@ if __name__ == "__main__":
 
     while True:
         try:
-            prompt = f"({thread_id[-6:]}*) you> " if pending_fork_prefix else f"({thread_id[-6:]}) you> "
+            prompt = (
+                f"({thread_id[-6:]}|{current_mode}{'*' if pending_fork_prefix else ''}) you> "
+            )
             user_in = input(prompt).strip()
         except (EOFError, KeyboardInterrupt):
             print()
@@ -219,6 +319,19 @@ if __name__ == "__main__":
             _print_history(thread_id)
             continue
 
+        if user_in.startswith("/mode"):
+            parts = user_in.split(maxsplit=1)
+            if len(parts) < 2:
+                print(f"[stream mode = {current_mode}]  options: {', '.join(STREAM_MODES)}\n")
+                continue
+            new_mode = parts[1].strip()
+            if new_mode not in STREAM_MODES:
+                print(f"[unknown mode {new_mode!r}; options: {', '.join(STREAM_MODES)}]\n")
+                continue
+            current_mode = new_mode
+            print(f"[stream mode -> {current_mode}]\n")
+            continue
+
         if user_in.startswith("/fork"):
             parts = user_in.split(maxsplit=1)
             if len(parts) < 2:
@@ -235,8 +348,6 @@ if __name__ == "__main__":
         config = {"configurable": {"thread_id": thread_id}}
 
         if pending_fork_prefix:
-            # Find the matching historical checkpoint by id suffix
-            # (matches the short form shown by /history).
             snapshots = list(agent.get_state_history(config))
             match = next(
                 (s for s in snapshots
@@ -248,22 +359,9 @@ if __name__ == "__main__":
                 print(f"[no checkpoint matching {pending_fork_prefix!r}; aborting fork]\n")
                 pending_fork_prefix = None
                 continue
-            # Replaying with a config that includes checkpoint_id makes the new
-            # checkpoints descend from `match` instead of the latest tip.
             config = match.config
             print(f"[forking from {_short(match.config['configurable']['checkpoint_id'])}]")
             pending_fork_prefix = None
 
-        # Track message count before invoke so we only print what's new.
-        try:
-            prev = agent.get_state(config).values.get("messages", [])
-        except Exception:
-            prev = []
-        prev_count = len(prev) + 1  # +1 because we're about to add this user message
-
-        result = agent.invoke(
-            {"messages": [{"role": "user", "content": user_in}]},
-            config=config,
-        )
-        _print_new_messages(prev_count, result["messages"])
+        _run_turn(user_in, config, current_mode)
         print()
