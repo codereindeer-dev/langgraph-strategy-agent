@@ -1,16 +1,24 @@
 """
-CH04 — streaming.
+CH05 — subgraph + parallel fan-out with `Send`.
 
-Same graph as CH03 (llm + tools + checkpointer). The only change is how we
-consume the output: instead of `invoke()` blocking until the whole graph
-finishes, we use `stream()` / `astream_events()` to surface intermediate
-events. The REPL exposes a `/mode` slash command so you can swap between:
+Same ReAct loop as CH04 (llm + ToolNode + checkpointer + streaming),
+plus one new tool `compare_strategies(ticker, windows)`. When the LLM
+calls it, the conditional edge after `llm` fans out N parallel
+`backtest_subgraph` invocations via `Send`. Each subgraph runs its own
+internal flow (`fetch -> sma -> score`) and writes a single result row
+into the parent-graph `backtest_results` channel. After all parallel
+branches finish, `finalize` reduces them into one `ToolMessage` so the
+LLM can summarize.
 
-    updates    — one chunk per node, only the channel diff (default)
-    values     — full state after each step
-    messages   — LLM tokens stream out live (typing animation)
-    debug      — every internal event (task start/end, checkpoint writes)
-    events     — astream_events v2: per-LLM-token + per-tool start/end
+New concepts vs CH04:
+- Subgraph: a separate `StateGraph` compiled and used as a single node.
+- `Send`: from a conditional edge, return `[Send("node", payload), ...]`
+  to fan out N parallel invocations. Each invocation gets `payload` as
+  its initial state.
+- Custom reducer: parent's `backtest_results` uses a reducer that
+  appends fan-in results and accepts a "CLEAR" sentinel to reset.
+- `stream(..., subgraphs=True)`: surfaces subgraph-internal events so
+  parallel execution is visible (otherwise the subgraph is one chunk).
 
 Run:
     pip install -r requirements.txt
@@ -32,21 +40,36 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
+from langgraph.types import Send
 
 load_dotenv(override=True)
 
 
+# ---------- Reducer for the fan-in channel ------------------------------------
+
+_CLEAR = "CLEAR"
+
+
+def _bt_reducer(left, right):
+    """Append `right` to `left`; "CLEAR" sentinel resets to empty list."""
+    if right == _CLEAR:
+        return []
+    return (left or []) + list(right or [])
+
+
 class State(TypedDict):
-    """Same shape as CH01-CH03 — streaming doesn't change State."""
+    """Parent-graph state. `backtest_results` is the fan-in channel."""
     messages: Annotated[list, add_messages]
+    backtest_results: Annotated[list, _bt_reducer]
 
 
-# ---------- Tools (same as CH02/CH03) -----------------------------------------
+# ---------- Tools the LLM can see ---------------------------------------------
 
 @tool(parse_docstring=True)
 def get_price_data(ticker: str, days: int = 30) -> str:
@@ -83,37 +106,234 @@ def compute_sma(prices: list[float], window: int) -> str:
     return json.dumps({"window": window, "sma": sma})
 
 
-TOOLS = [get_price_data, compute_sma]
+@tool(parse_docstring=True)
+def compare_strategies(ticker: str, windows: list[int]) -> str:
+    """Backtest a price-vs-SMA crossover on 60 days of synthetic prices for the same ticker across multiple SMA windows IN PARALLEL, and return per-window metrics (total return %, Sharpe, number of trades). Use this when the user wants to compare two or more SMA window sizes.
+
+    Args:
+        ticker: Ticker symbol, e.g. "AAPL".
+        windows: SMA window sizes to compare, e.g. [20, 50, 100].
+    """
+    # Body never runs: the conditional edge after `llm` intercepts this
+    # tool call and dispatches a `Send` per window into the subgraph.
+    raise NotImplementedError("intercepted by graph router")
 
 
-# ---------- Model + nodes (same as CH02/CH03) ---------------------------------
+# Tools the LLM is told about (schema only for compare_strategies):
+LLM_TOOLS = [get_price_data, compute_sma, compare_strategies]
+# Tools the regular ToolNode actually executes:
+EXEC_TOOLS = [get_price_data, compute_sma]
 
-llm = ChatAnthropic(model="claude-sonnet-4-6", max_tokens=1024).bind_tools(TOOLS)
+
+# ---------- Backtest subgraph -------------------------------------------------
+
+BACKTEST_DAYS = 60
+
+
+class BacktestState(TypedDict):
+    """Subgraph state. The `Send` payload populates ticker/window/tool_call_id;
+    the rest is filled in as the subgraph runs.
+    """
+    ticker: str
+    window: int
+    tool_call_id: str
+    prices: list[float]
+    sma: list[float]
+    # Same channel name as the parent so the result flows back automatically.
+    backtest_results: Annotated[list, _bt_reducer]
+
+
+def bt_fetch(state: BacktestState) -> dict:
+    seed = int(
+        hashlib.md5(f"{state['ticker']}|{BACKTEST_DAYS}".encode()).hexdigest()[:8],
+        16,
+    )
+    random.seed(seed)
+    base = 100.0
+    prices = []
+    for _ in range(BACKTEST_DAYS):
+        base *= 1 + random.uniform(-0.02, 0.02)
+        prices.append(round(base, 2))
+    return {"prices": prices}
+
+
+def bt_sma(state: BacktestState) -> dict:
+    w = state["window"]
+    prices = state["prices"]
+    if w <= 0 or w > len(prices):
+        return {"sma": []}
+    sma = [
+        round(sum(prices[i - w + 1 : i + 1]) / w, 2)
+        for i in range(w - 1, len(prices))
+    ]
+    return {"sma": sma}
+
+
+def bt_score(state: BacktestState) -> dict:
+    """Toy backtest: long when close > SMA, flat otherwise."""
+    prices = state["prices"]
+    sma = state["sma"]
+    w = state["window"]
+
+    if not sma:
+        result = {
+            "ticker": state["ticker"],
+            "window": w,
+            "tool_call_id": state["tool_call_id"],
+            "total_return_pct": 0.0,
+            "sharpe": 0.0,
+            "n_trades": 0,
+            "note": "window too large for available prices",
+        }
+        return {"backtest_results": [result]}
+
+    rets: list[float] = []
+    pos = 0
+    trades = 0
+    # prices[i + w - 1] aligns with sma[i]; we trade on the next day's return.
+    for i in range(len(sma) - 1):
+        p_idx = i + w - 1
+        new_pos = 1 if prices[p_idx] > sma[i] else 0
+        if new_pos != pos:
+            trades += 1
+        pos = new_pos
+        day_ret = (prices[p_idx + 1] / prices[p_idx] - 1) * pos
+        rets.append(day_ret)
+
+    total_return = round(sum(rets) * 100, 2)
+    if rets:
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / len(rets)
+        std = var ** 0.5
+        sharpe = round(mean / std * (252 ** 0.5), 2) if std > 0 else 0.0
+    else:
+        sharpe = 0.0
+
+    result = {
+        "ticker": state["ticker"],
+        "window": w,
+        "tool_call_id": state["tool_call_id"],
+        "total_return_pct": total_return,
+        "sharpe": sharpe,
+        "n_trades": trades,
+    }
+    return {"backtest_results": [result]}
+
+
+_bt_graph = StateGraph(BacktestState)
+_bt_graph.add_node("fetch", bt_fetch)
+_bt_graph.add_node("sma", bt_sma)
+_bt_graph.add_node("score", bt_score)
+_bt_graph.add_edge(START, "fetch")
+_bt_graph.add_edge("fetch", "sma")
+_bt_graph.add_edge("sma", "score")
+_bt_graph.add_edge("score", END)
+backtest_subgraph = _bt_graph.compile()
+
+
+# ---------- Parent graph: llm + tools + subgraph + finalize -------------------
+
+llm = ChatAnthropic(model="claude-sonnet-4-6", max_tokens=1024).bind_tools(LLM_TOOLS)
 
 
 def llm_node(state: State) -> dict:
     return {"messages": [llm.invoke(state["messages"])]}
 
 
-tool_node = ToolNode(TOOLS)
+tool_node = ToolNode(EXEC_TOOLS)
 
 
-# ---------- Graph + checkpointer (same as CH03) -------------------------------
+def route_after_llm(state: State):
+    """Custom router replacing CH04's `tools_condition`.
+
+    - no tool_calls            -> END
+    - compare_strategies call  -> list of `Send` to backtest_subgraph (fan-out)
+    - any other tool call      -> "tools" (ToolNode)
+    """
+    last = state["messages"][-1]
+    tool_calls = getattr(last, "tool_calls", None) or []
+    if not tool_calls:
+        return END
+
+    sends: list[Send] = []
+    has_regular = False
+    for tc in tool_calls:
+        if tc["name"] == "compare_strategies":
+            args = tc.get("args", {}) or {}
+            ticker = args.get("ticker", "")
+            windows = args.get("windows", []) or []
+            for w in windows:
+                sends.append(
+                    Send(
+                        "backtest_subgraph",
+                        {
+                            "ticker": ticker,
+                            "window": int(w),
+                            "tool_call_id": tc["id"],
+                        },
+                    )
+                )
+        else:
+            has_regular = True
+
+    if sends:
+        return sends
+    if has_regular:
+        return "tools"
+    return END
+
+
+def finalize(state: State) -> dict:
+    """Fan-in: reduce aggregated backtest_results into one ToolMessage."""
+    results = state.get("backtest_results", []) or []
+    if not results:
+        return {}
+    tool_call_id = results[0]["tool_call_id"]
+    sorted_results = sorted(results, key=lambda r: r["window"])
+    summary = {
+        "ticker": sorted_results[0]["ticker"],
+        "compared_windows": [r["window"] for r in sorted_results],
+        "results": [
+            {k: v for k, v in r.items() if k != "tool_call_id"}
+            for r in sorted_results
+        ],
+    }
+    msg = ToolMessage(
+        content=json.dumps(summary),
+        tool_call_id=tool_call_id,
+        name="compare_strategies",
+    )
+    return {"messages": [msg], "backtest_results": _CLEAR}
+
 
 graph = StateGraph(State)
 graph.add_node("llm", llm_node)
 graph.add_node("tools", tool_node)
+graph.add_node("backtest_subgraph", backtest_subgraph)
+graph.add_node("finalize", finalize)
+
 graph.add_edge(START, "llm")
-graph.add_conditional_edges("llm", tools_condition)
+graph.add_conditional_edges(
+    "llm",
+    route_after_llm,
+    {
+        "tools": "tools",
+        "backtest_subgraph": "backtest_subgraph",
+        END: END,
+    },
+)
 graph.add_edge("tools", "llm")
+graph.add_edge("backtest_subgraph", "finalize")
+graph.add_edge("finalize", "llm")
 
 checkpointer = InMemorySaver()
 agent = graph.compile(checkpointer=checkpointer)
 
-print(agent.get_graph().draw_mermaid())
+# xray=1 expands the subgraph in the mermaid output.
+print(agent.get_graph(xray=1).draw_mermaid())
 
 
-# ---------- Stream-mode formatters --------------------------------------------
+# ---------- Stream formatters (CH04 + subgraph namespace) ---------------------
 
 STREAM_MODES = ("updates", "values", "messages", "debug", "events")
 
@@ -136,36 +356,89 @@ def _summarize_msg(m) -> str:
         text = m.content if isinstance(m.content, str) else ""
         return f"ai:   {text[:40]}"
     if kind == "ToolMessage":
-        return f"tool: {m.name} -> {str(m.content)[:30]}"
+        return f"tool: {m.name} -> {str(m.content)[:40]}"
     return f"{kind}: ..."
 
 
+def _ns_label(ns: tuple) -> str:
+    """Format namespace tuple from stream(subgraphs=True).
+
+    () for parent, ("backtest_subgraph:UUID",) for subgraph branches.
+    We show the node name + last 4 chars of the UUID so parallel
+    branches are distinguishable.
+    """
+    if not ns:
+        return "main"
+    parts = []
+    for elem in ns:
+        if ":" in elem:
+            name, _, tail = elem.partition(":")
+            parts.append(f"{name}#{tail[-4:]}")
+        else:
+            parts.append(elem)
+    return "/".join(parts)
+
+
+def _fmt_bt(r: dict) -> str:
+    if "note" in r:
+        return f"bt w={r.get('window'):<3} ({r['note']})"
+    return (
+        f"bt w={r.get('window'):<3} "
+        f"ret={r.get('total_return_pct'):>6}% "
+        f"sharpe={r.get('sharpe'):>5} "
+        f"trades={r.get('n_trades')}"
+    )
+
+
 def _stream_sync(user_in: str, config: dict, mode: str) -> None:
-    """stream_mode in {updates, values, messages, debug}."""
+    """stream_mode in {updates, values, messages, debug} with subgraphs=True."""
     payload = {"messages": [{"role": "user", "content": user_in}]}
     step = 0
 
-    for chunk in agent.stream(payload, config=config, stream_mode=mode):
-        step += 1
+    for ns, chunk in agent.stream(
+        payload, config=config, stream_mode=mode, subgraphs=True
+    ):
+        ns_lbl = _ns_label(ns)
 
         if mode == "updates":
-            # chunk: {node_name: {channel: diff}}
+            # chunk: {node_name: {channel: diff}}. Step counter only ticks
+            # when we actually print, so the numbering is dense.
             for node, diff in chunk.items():
-                for m in diff.get("messages", []):
-                    print(f"[{step:>2}] [{node:>5}] {_summarize_msg(m)}")
+                if not isinstance(diff, dict):
+                    continue
+                printed_here = False
+                for m in diff.get("messages", []) or []:
+                    step += 1
+                    printed_here = True
+                    print(f"[{step:>2}] [{ns_lbl:>22}] [{node:>9}] {_summarize_msg(m)}")
+                for r in diff.get("backtest_results", []) or []:
+                    if isinstance(r, dict):
+                        step += 1
+                        printed_here = True
+                        print(f"[{step:>2}] [{ns_lbl:>22}] [{node:>9}] {_fmt_bt(r)}")
+                if not printed_here:
+                    # Subgraph internal step touched a channel we don't render
+                    # (e.g. fetch -> prices, sma -> sma). Show it as a trace
+                    # so parallel fan-out is visible end-to-end.
+                    other = [k for k in diff.keys()
+                             if k not in ("messages", "backtest_results")]
+                    if other:
+                        step += 1
+                        print(f"[{step:>2}] [{ns_lbl:>22}] [{node:>9}] wrote: {','.join(other)}")
 
         elif mode == "values":
-            # chunk: full state dict (after this step)
-            msgs = chunk.get("messages", [])
+            step += 1
+            msgs = chunk.get("messages", []) if isinstance(chunk, dict) else []
+            bt = chunk.get("backtest_results", []) if isinstance(chunk, dict) else []
             last = _summarize_msg(msgs[-1]) if msgs else "-"
-            print(f"[{step:>2}] [values] msgs={len(msgs):<2} last={last}")
+            print(
+                f"[{step:>2}] [{ns_lbl:>22}] [values] "
+                f"msgs={len(msgs):<2} bt={len(bt):<2} last={last}"
+            )
 
         elif mode == "messages":
-            # chunk: (BaseMessageChunk, metadata)
             msg_chunk, meta = chunk
-            node = meta.get("langgraph_node", "?")
             kind = msg_chunk.__class__.__name__
-
             if kind in ("AIMessageChunk", "AIMessage"):
                 content = msg_chunk.content
                 if isinstance(content, str):
@@ -183,22 +456,29 @@ def _stream_sync(user_in: str, config: dict, mode: str) -> None:
             elif kind == "ToolMessage":
                 content = str(msg_chunk.content)
                 preview = content if len(content) <= 100 else content[:100] + "..."
-                print(f"\n[tool_res ] {msg_chunk.name} -> {preview}")
+                print(f"\n[tool_res ] [{ns_lbl}] {msg_chunk.name} -> {preview}")
 
         elif mode == "debug":
+            step += 1
             kind = chunk.get("type", "?")
             step_n = chunk.get("step", "?")
-            payload_inner = chunk.get("payload", {})
+            payload_inner = chunk.get("payload", {}) or {}
             name = payload_inner.get("name", "")
-            print(f"[{step:>3}] [debug] type={kind:<13} step={step_n}  name={name}")
+            print(
+                f"[{step:>3}] [{ns_lbl:>22}] [debug] "
+                f"type={kind:<13} step={step_n}  name={name}"
+            )
 
     if mode == "messages":
-        print()  # final newline after token stream
+        print()
+
+
+# Subgraph internal nodes whose start/end we want to surface in events mode.
+_SUBGRAPH_NODES = {"backtest_subgraph", "fetch", "sma", "score", "finalize"}
 
 
 async def _stream_events(user_in: str, config: dict) -> None:
-    """astream_events v2 — finer than stream_mode='messages': also gives
-    on_tool_start / on_tool_end / on_chain_* / on_chat_model_start, etc."""
+    """astream_events v2 — subgraph events nest automatically."""
     payload = {"messages": [{"role": "user", "content": user_in}]}
     streaming_text = False
 
@@ -239,6 +519,10 @@ async def _stream_events(user_in: str, config: dict) -> None:
             output_str = str(getattr(output_obj, "content", output_obj))
             preview = output_str if len(output_str) <= 80 else output_str[:80] + "..."
             print(f"[event] on_tool_end          name={name}  output={preview}")
+        elif kind == "on_chain_start" and name in _SUBGRAPH_NODES:
+            print(f"[event] on_chain_start       name={name}")
+        elif kind == "on_chain_end" and name in _SUBGRAPH_NODES:
+            print(f"[event] on_chain_end         name={name}")
 
     if streaming_text:
         print()
@@ -251,7 +535,7 @@ def _run_turn(user_in: str, config: dict, mode: str) -> None:
         _stream_sync(user_in, config, mode)
 
 
-# ---------- REPL helpers (same as CH03) ---------------------------------------
+# ---------- REPL helpers (same as CH03/CH04) ----------------------------------
 
 def _print_history(thread_id: str) -> None:
     config = {"configurable": {"thread_id": thread_id}}
@@ -260,13 +544,13 @@ def _print_history(thread_id: str) -> None:
         print("(no history for this thread)")
         return
     print(f"--- history for thread {thread_id} ({len(snapshots)} checkpoints, newest first) ---")
-    print(f"  {'ckpt':<10} {'next':<12} {'msgs':<4}  last")
+    print(f"  {'ckpt':<10} {'next':<22} {'msgs':<4}  last")
     for s in snapshots:
         cid = s.config["configurable"].get("checkpoint_id")
         next_nodes = ",".join(s.next) if s.next else "END"
-        msgs = s.values.get("messages", [])
+        msgs = s.values.get("messages", []) if isinstance(s.values, dict) else []
         last_label = _summarize_msg(msgs[-1]) if msgs else "-"
-        print(f"  {_short(cid):<10} {next_nodes:<12} {len(msgs):<4}  {last_label}")
+        print(f"  {_short(cid):<10} {next_nodes:<22} {len(msgs):<4}  {last_label}")
     print()
 
 
@@ -281,9 +565,11 @@ if __name__ == "__main__":
     pending_fork_prefix: str | None = None
     current_mode = "updates"
 
-    print("[init] CH04 — streaming")
+    print("[init] CH05 — subgraph + parallel fan-out (Send)")
     print(f"[init] thread_id   = {thread_id}")
     print(f"[init] stream mode = {current_mode}  (try /mode for others)")
+    print("[hint] try:")
+    print("       比較 AAPL 的 SMA 20、50、100 三組策略")
     print("[hint] commands:")
     print("       /mode [name]  show or switch stream mode")
     print(f"                     options: {', '.join(STREAM_MODES)}")
