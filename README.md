@@ -16,8 +16,9 @@ LangGraph 教學專案 —— 每個 commit 對應一個章節，從第一個 `S
 - **CH02** — 加 `@tool` 工具（`get_price_data` / `compute_sma`，md5 seed 可重現）+ `tools_condition` 條件邊 + `tools → llm` 迴圈（ReAct loop）
 - **CH03** — `InMemorySaver` checkpointer，每個 node 邊界自動存 state snapshot。多輪對話、`/history` 看 checkpoint 鏈、`/fork` 從任一歷史點 replay（time travel）
 - **CH04** — `agent.stream()` / `astream_events()`，五種 stream mode（updates / values / messages / debug / events）即時看圖內事件
+- **CH05** — Subgraph + `Send` API：`compare_strategies` 工具觸發 N 個 `backtest_subgraph` 平行 fan-out（fetch → sma → score 各自跑），`finalize` 把結果 fan-in 成一個 `ToolMessage`。自訂 reducer + `stream(subgraphs=True)` 看平行執行
 
-目標終局（規劃中）：subgraph 平行回測、`interrupt()` HITL 讓人類批准策略 code、`backtesting.py` 整合產出可執行回測腳本。
+目標終局（規劃中）：`interrupt()` HITL 讓人類批准策略 code、`backtesting.py` 整合產出可執行回測腳本。
 
 ---
 
@@ -29,28 +30,7 @@ cp .env.example .env   # 填入 ANTHROPIC_API_KEY
 python agent.py
 ```
 
-```
-[init] CH04 — streaming
-[init] thread_id   = demo-a1b2c3
-[init] stream mode = updates  (try /mode for others)
-(a1b2c3|updates) you> 幫我抓 AAPL 最近 30 天的價格，算 5 日均線
-[ 1] [  llm] ai:   tool_call -> get_price_data
-[ 2] [tools] tool: get_price_data -> {"ticker": "AAPL", ...
-[ 3] [  llm] ai:   tool_call -> compute_sma
-[ 4] [tools] tool: compute_sma -> {"window": 5, "sma": ...
-[ 5] [  llm] ai:   AAPL 最近 30 天最後一筆 SMA(5) 是 ...
-```
-
-切換成 token-by-token 串流：
-
-```
-(a1b2c3|updates) you> /mode messages
-[stream mode -> messages]
-(a1b2c3|messages) you> 用同樣的資料算 20 日均線
-[tool_call] compute_sma args={"prices": [...], "window": 20}
-[tool_res ] compute_sma -> {"window": 20, "sma": [...
-20 日均線最後一筆是 ...
-```
+跑起來會進 REPL —— 輸出格式、stream mode、slash command 看下面三節。 完整逐章 walkthrough（含 captured output）在文章系列：[CH01](https://codereindeer.com/langgraph-first-stategraph) → [CH02](https://codereindeer.com/langgraph-tools-and-routing) → [CH03](https://codereindeer.com/langgraph-checkpointing) → [CH04](https://codereindeer.com/langgraph-streaming) → [CH05](https://codereindeer.com/langgraph-subgraph-fanout)。
 
 ---
 
@@ -84,6 +64,7 @@ python agent.py
 |------|------|
 | `get_price_data(ticker, days=30)` | 用 `md5(ticker\|days)` seed 的偽隨機 walk 產出 daily close。可重現、無外部 API |
 | `compute_sma(prices, window)` | 標準 SMA（window 內平均） |
+| `compare_strategies(ticker, windows)` *(CH05)* | LLM-only schema —— 實際執行被 conditional edge 攔截，fan-out 成 N 個 `backtest_subgraph` 分支跑「價格 vs SMA」交叉策略，回 per-window 的報酬率 / Sharpe / 交易次數 |
 
 工具是教學用的最小可跑版本 —— 真實接 yfinance / 券商 API 是之後章節的事。重點在 graph 架構與 agent 行為，不在資料源。
 
@@ -108,13 +89,13 @@ README.md           # 你正在讀這個
 | `64628c7` | **CH02** | 加 ReAct loop：`@tool` 工具、`tools_condition` 條件邊、`tools → llm` 迴圈、Windows UTF-8 stdout fix |
 | `9680148` | **CH03** | `InMemorySaver` checkpointer → 多輪對話 + `/history` 看 checkpoint 鏈 + `/fork` time travel |
 | `1e35afb` | **CH04** | `stream()` / `astream_events()`，五種 stream mode、`/mode` 即時切換 |
+| `fdd2440` | **CH05** | Subgraph + `Send` API 平行 fan-out：`compare_strategies` 工具觸發 N 個 `backtest_subgraph`、`finalize` fan-in 成單一 `ToolMessage`、自訂 reducer、`subgraphs=True` 看平行執行 |
 
 照著讀的方式：`git checkout bd68c24` 看最簡單的版本（單節點圖），然後一路 `git log -p` 往新的 commit diff 過去，每個 chapter 都是一個明確、可獨立理解的概念加法。
 
 ### 規劃中
 
-- **CH05** — `interrupt()` HITL：策略 code 產出後暫停，等使用者批准才執行
-- **CH06** — Subgraph + 平行回測：一次跑多組參數，`Send` API 扇出
+- **CH06** — `interrupt()` HITL：策略 code 產出後暫停，等使用者批准才執行
 - **CH07** — `backtesting.py` 整合：LLM 產出 `Strategy` 子類 → 沙箱執行 → 回傳 metrics
 - **CH08** — 持久化 checkpointer（SQLite / Postgres）+ 跨 session 接續
 
