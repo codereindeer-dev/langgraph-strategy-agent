@@ -30,8 +30,6 @@ cp .env.example .env   # 填入 ANTHROPIC_API_KEY
 python agent.py
 ```
 
-跑起來會進 REPL —— 輸出格式、stream mode、slash command 看下面三節。 完整逐章 walkthrough（含 captured output）在文章系列：[CH01](https://codereindeer.com/langgraph-first-stategraph) → [CH02](https://codereindeer.com/langgraph-tools-and-routing) → [CH03](https://codereindeer.com/langgraph-checkpointing) → [CH04](https://codereindeer.com/langgraph-streaming) → [CH05](https://codereindeer.com/langgraph-subgraph-fanout)。
-
 ---
 
 ## REPL slash commands
