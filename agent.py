@@ -539,18 +539,61 @@ def _run_turn(user_in: str, config: dict, mode: str) -> None:
 
 def _print_history(thread_id: str) -> None:
     config = {"configurable": {"thread_id": thread_id}}
-    snapshots = list(agent.get_state_history(config))
-    if not snapshots:
+    snaps = {
+        s.config["configurable"]["checkpoint_id"]: s
+        for s in agent.get_state_history(config)
+    }
+    if not snaps:
         print("(no history for this thread)")
         return
-    print(f"--- history for thread {thread_id} ({len(snapshots)} checkpoints, newest first) ---")
-    print(f"  {'ckpt':<10} {'next':<22} {'msgs':<4}  last")
-    for s in snapshots:
-        cid = s.config["configurable"].get("checkpoint_id")
-        next_nodes = ",".join(s.next) if s.next else "END"
+
+    def parent_of(cid: str) -> str | None:
+        p = (snaps[cid].parent_config or {}).get("configurable", {}).get("checkpoint_id")
+        return p if p in snaps else None
+
+    def label(cid: str) -> str:
+        s = snaps[cid]
         msgs = s.values.get("messages", []) if isinstance(s.values, dict) else []
-        last_label = _summarize_msg(msgs[-1]) if msgs else "-"
-        print(f"  {_short(cid):<10} {next_nodes:<22} {len(msgs):<4}  {last_label}")
+        last = _summarize_msg(msgs[-1]) if msgs else "-"
+        nxt = ",".join(s.next) if s.next else "END"
+        return f"{_short(cid):<10} next={nxt:<22} msgs={len(msgs):<2}  {last}"
+
+    # `git log --graph --all` style. get_state_history returns checkpoints
+    # newest-first; the branch structure lives in each snapshot's parent_config.
+    # We walk newest -> oldest keeping one "lane" per live branch tip:
+    #   *        a checkpoint in this lane
+    #   | *      a checkpoint in a side branch (parent lane still pending)
+    #   |/       a fork point: the side lane rejoins its parent's lane
+    lanes: list[str | None] = []   # lanes[i] = the cid that lane i is waiting to emit
+    rows: list[tuple[str, str | None]] = []
+    for cid in snaps:
+        cols = [i for i, x in enumerate(lanes) if x == cid]
+        if not cols:                       # a branch tip: open a new lane
+            lanes.append(cid)
+            cols = [len(lanes) - 1]
+        col = cols[0]
+        # A fork point is awaited by several lanes; collapse the extras first.
+        for d in sorted((i for i in cols if i != col), reverse=True):
+            lanes[d] = None
+            merge = ["|" if lanes[i] is not None else " " for i in range(d)]
+            rows.append((" ".join(merge) + "/", None))
+            while lanes and lanes[-1] is None:
+                lanes.pop()
+        cells = ["*" if i == col else ("|" if x is not None else " ")
+                 for i, x in enumerate(lanes)]
+        rows.append((" ".join(cells), label(cid)))
+        parent = parent_of(cid)
+        lanes[col] = parent
+        if parent is None:                 # reached a root: close the lane
+            lanes[col] = None
+            while lanes and lanes[-1] is None:
+                lanes.pop()
+
+    width = max(len(g) for g, _ in rows)
+    print(f"--- history graph for thread {thread_id} "
+          f"({len(snaps)} checkpoints, newest at top) ---")
+    for graph, lbl in rows:
+        print(graph if lbl is None else f"{graph:<{width}}  {lbl}")
     print()
 
 
