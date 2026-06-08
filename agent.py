@@ -1,24 +1,31 @@
 """
-CH05 — subgraph + parallel fan-out with `Send`.
+CH06 — `interrupt()` HITL (human-in-the-loop).
 
-Same ReAct loop as CH04 (llm + ToolNode + checkpointer + streaming),
-plus one new tool `compare_strategies(ticker, windows)`. When the LLM
-calls it, the conditional edge after `llm` fans out N parallel
-`backtest_subgraph` invocations via `Send`. Each subgraph runs its own
-internal flow (`fetch -> sma -> score`) and writes a single result row
-into the parent-graph `backtest_results` channel. After all parallel
-branches finish, `finalize` reduces them into one `ToolMessage` so the
-LLM can summarize.
+Same graph as CH05 (llm + ToolNode + backtest_subgraph + finalize),
+plus one new node `human_approval` that gates the fan-out:
 
-New concepts vs CH04:
-- Subgraph: a separate `StateGraph` compiled and used as a single node.
-- `Send`: from a conditional edge, return `[Send("node", payload), ...]`
-  to fan out N parallel invocations. Each invocation gets `payload` as
-  its initial state.
-- Custom reducer: parent's `backtest_results` uses a reducer that
-  appends fan-in results and accepts a "CLEAR" sentinel to reset.
-- `stream(..., subgraphs=True)`: surfaces subgraph-internal events so
-  parallel execution is visible (otherwise the subgraph is one chunk).
+    llm -> human_approval -> {backtest_subgraph (Send fan-out) | llm}
+
+When the LLM calls `compare_strategies`, the graph routes to
+`human_approval` (instead of dispatching `Send` directly as in CH05).
+That node calls `interrupt({...})` with a payload describing the
+proposed run; the graph pauses, the REPL prompts the human, and the
+human's reply is delivered back to the node via `Command(resume=...)`.
+If approved, control flows to `Send` fan-out as before; if rejected,
+the node injects a rejection `ToolMessage` and routes back to `llm` so
+the model can re-propose.
+
+New concepts vs CH05:
+- `interrupt(payload)`: pauses the running graph at the call site and
+  bubbles `payload` up to the caller. On resume, the call returns the
+  resume value as if it had been computed locally.
+- `Command(resume=value)`: passed to `agent.stream(...)` to continue a
+  paused graph from where it stopped. Works hand-in-hand with the
+  checkpointer (CH03) — without a checkpointer, there is nothing to
+  resume from.
+- Conditional edge after a HITL node: the same `Send`-or-named-node
+  pattern as CH05's `route_after_llm`, but driven by the approval
+  outcome instead of the LLM's tool_call.
 
 Run:
     pip install -r requirements.txt
@@ -46,7 +53,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from langgraph.types import Send
+from langgraph.types import Command, Send, interrupt
 
 load_dotenv(override=True)
 
@@ -246,8 +253,12 @@ tool_node = ToolNode(EXEC_TOOLS)
 def route_after_llm(state: State):
     """Custom router replacing CH04's `tools_condition`.
 
+    Changed from CH05: instead of returning `Send`s directly, route
+    `compare_strategies` calls to `human_approval` so the graph pauses
+    for HITL gating before fan-out.
+
     - no tool_calls            -> END
-    - compare_strategies call  -> list of `Send` to backtest_subgraph (fan-out)
+    - compare_strategies call  -> "human_approval" (HITL gate)
     - any other tool call      -> "tools" (ToolNode)
     """
     last = state["messages"][-1]
@@ -255,32 +266,120 @@ def route_after_llm(state: State):
     if not tool_calls:
         return END
 
-    sends: list[Send] = []
-    has_regular = False
-    for tc in tool_calls:
-        if tc["name"] == "compare_strategies":
-            args = tc.get("args", {}) or {}
-            ticker = args.get("ticker", "")
-            windows = args.get("windows", []) or []
-            for w in windows:
-                sends.append(
-                    Send(
-                        "backtest_subgraph",
-                        {
-                            "ticker": ticker,
-                            "window": int(w),
-                            "tool_call_id": tc["id"],
-                        },
-                    )
-                )
-        else:
-            has_regular = True
+    has_compare = any(tc["name"] == "compare_strategies" for tc in tool_calls)
+    has_regular = any(tc["name"] != "compare_strategies" for tc in tool_calls)
 
-    if sends:
-        return sends
+    if has_compare:
+        return "human_approval"
     if has_regular:
         return "tools"
     return END
+
+
+def human_approval(state: State) -> dict:
+    """HITL gate: pause before fan-out so a human can approve / reject.
+
+    The node calls `interrupt({...})` with a payload describing what the
+    LLM wants to run. The caller (REPL) sees the payload via the
+    `__interrupt__` stream chunk, prompts the user, and resumes the graph
+    with `Command(resume=<reply>)`. The resume value becomes the return
+    value of `interrupt()`.
+
+    - "approve" (or "yes") -> return {} so `route_after_approval` falls
+      through to the Send fan-out (same as CH05 would have done).
+    - anything else        -> treat as rejection; inject a `ToolMessage`
+      naming the original tool_call_id so the LLM sees feedback and can
+      re-propose.
+    """
+    print("Enter human_approval")
+
+    last = state["messages"][-1]
+    tool_calls = getattr(last, "tool_calls", None) or []
+    compare_tc = next(
+        (tc for tc in tool_calls if tc["name"] == "compare_strategies"),
+        None,
+    )
+    if not compare_tc:
+        # Shouldn't happen: this node is only reached when route_after_llm
+        # sees a compare_strategies call pending.
+        return {}
+
+    args = compare_tc.get("args") or {}
+    ticker = args.get("ticker", "")
+    windows = args.get("windows", []) or []
+
+    # `interrupt` pauses the graph. The payload here is what the caller
+    # sees in the __interrupt__ chunk; the caller resumes by sending a
+    # string (or any JSON-able value) back via Command(resume=...).
+    decision = interrupt(
+        {
+            "type": "approve_compare_strategies",
+            "ticker": ticker,
+            "windows": windows,
+            "tool_call_id": compare_tc["id"],
+            "prompt": (
+                f"LLM wants to run compare_strategies(ticker={ticker!r}, "
+                f"windows={windows}). Approve? Reply 'yes' to proceed, or "
+                f"anything else to reject with feedback."
+            ),
+        }
+    )
+
+    # Normalize the resume value.
+    text = decision if isinstance(decision, str) else json.dumps(decision)
+    head = text.strip().lower()
+    if head in ("y", "yes", "ok", "approve", "approved"):
+        return {}  # approved -> route_after_approval will Send fan-out.
+
+    # Anything else is a rejection. Strip an optional leading "no" /
+    # "no:" / "reject:" so the rest is treated as feedback.
+    feedback = text.strip()
+    for prefix in ("reject:", "rejected:", "no:", "no", "reject", "rejected"):
+        if feedback.lower().startswith(prefix):
+            feedback = feedback[len(prefix):].lstrip(": ").strip()
+            break
+    if not feedback:
+        feedback = "User rejected the proposal without giving a reason."
+
+    rejection = ToolMessage(
+        content=json.dumps({"rejected": True, "feedback": feedback}),
+        tool_call_id=compare_tc["id"],
+        name="compare_strategies",
+    )
+    return {"messages": [rejection]}
+
+
+def route_after_approval(state: State):
+    """After `human_approval`, dispatch based on what was just appended.
+
+    - last msg is a rejection ToolMessage -> back to "llm" so the model
+      can react to the feedback (and possibly re-propose).
+    - last msg is still the original AIMessage (no rejection injected)
+      -> approved, emit Send fan-out to backtest_subgraph.
+    """
+    last = state["messages"][-1]
+    if last.__class__.__name__ == "ToolMessage":
+        return "llm"
+
+    tool_calls = getattr(last, "tool_calls", None) or []
+    sends: list[Send] = []
+    for tc in tool_calls:
+        if tc["name"] != "compare_strategies":
+            continue
+        args = tc.get("args", {}) or {}
+        ticker = args.get("ticker", "")
+        for w in args.get("windows", []) or []:
+            sends.append(
+                Send(
+                    "backtest_subgraph",
+                    {
+                        "ticker": ticker,
+                        "window": int(w),
+                        "tool_call_id": tc["id"],
+                    },
+                )
+            )
+    return sends or "llm"
 
 
 def finalize(state: State) -> dict:
@@ -309,6 +408,7 @@ def finalize(state: State) -> dict:
 graph = StateGraph(State)
 graph.add_node("llm", llm_node)
 graph.add_node("tools", tool_node)
+graph.add_node("human_approval", human_approval)
 graph.add_node("backtest_subgraph", backtest_subgraph)
 graph.add_node("finalize", finalize)
 
@@ -318,14 +418,24 @@ graph.add_conditional_edges(
     route_after_llm,
     {
         "tools": "tools",
-        "backtest_subgraph": "backtest_subgraph",
+        "human_approval": "human_approval",
         END: END,
     },
 )
 graph.add_edge("tools", "llm")
+graph.add_conditional_edges(
+    "human_approval",
+    route_after_approval,
+    {
+        "llm": "llm",
+        "backtest_subgraph": "backtest_subgraph",
+    },
+)
 graph.add_edge("backtest_subgraph", "finalize")
 graph.add_edge("finalize", "llm")
 
+# Checkpointer is required for interrupt() / Command(resume=...) to work:
+# the graph pauses by writing a checkpoint and resumes by reading it.
 checkpointer = InMemorySaver()
 agent = graph.compile(checkpointer=checkpointer)
 
@@ -390,97 +500,149 @@ def _fmt_bt(r: dict) -> str:
     )
 
 
-def _stream_sync(user_in: str, config: dict, mode: str) -> None:
-    """stream_mode in {updates, values, messages, debug} with subgraphs=True."""
-    payload = {"messages": [{"role": "user", "content": user_in}]}
-    step = 0
-
-    for ns, chunk in agent.stream(
-        payload, config=config, stream_mode=mode, subgraphs=True
-    ):
-        ns_lbl = _ns_label(ns)
-
-        if mode == "updates":
-            # chunk: {node_name: {channel: diff}}. Step counter only ticks
-            # when we actually print, so the numbering is dense.
-            for node, diff in chunk.items():
-                if not isinstance(diff, dict):
-                    continue
-                printed_here = False
-                for m in diff.get("messages", []) or []:
+def _print_stream_chunk(ns_lbl: str, chunk, mode: str, step: int) -> int:
+    """Render one stream chunk for the given mode. Returns the new step counter."""
+    if mode == "updates":
+        for node, diff in chunk.items():
+            if not isinstance(diff, dict):
+                continue
+            printed_here = False
+            for m in diff.get("messages", []) or []:
+                step += 1
+                printed_here = True
+                print(f"[{step:>2}] [{ns_lbl:>22}] [{node:>14}] {_summarize_msg(m)}")
+            for r in diff.get("backtest_results", []) or []:
+                if isinstance(r, dict):
                     step += 1
                     printed_here = True
-                    print(f"[{step:>2}] [{ns_lbl:>22}] [{node:>9}] {_summarize_msg(m)}")
-                for r in diff.get("backtest_results", []) or []:
-                    if isinstance(r, dict):
-                        step += 1
-                        printed_here = True
-                        print(f"[{step:>2}] [{ns_lbl:>22}] [{node:>9}] {_fmt_bt(r)}")
-                if not printed_here:
-                    # Subgraph internal step touched a channel we don't render
-                    # (e.g. fetch -> prices, sma -> sma). Show it as a trace
-                    # so parallel fan-out is visible end-to-end.
-                    other = [k for k in diff.keys()
-                             if k not in ("messages", "backtest_results")]
-                    if other:
-                        step += 1
-                        print(f"[{step:>2}] [{ns_lbl:>22}] [{node:>9}] wrote: {','.join(other)}")
+                    print(f"[{step:>2}] [{ns_lbl:>22}] [{node:>14}] {_fmt_bt(r)}")
+            if not printed_here:
+                other = [k for k in diff.keys()
+                         if k not in ("messages", "backtest_results")]
+                if other:
+                    step += 1
+                    print(f"[{step:>2}] [{ns_lbl:>22}] [{node:>14}] wrote: {','.join(other)}")
 
-        elif mode == "values":
-            step += 1
-            msgs = chunk.get("messages", []) if isinstance(chunk, dict) else []
-            bt = chunk.get("backtest_results", []) if isinstance(chunk, dict) else []
-            last = _summarize_msg(msgs[-1]) if msgs else "-"
-            print(
-                f"[{step:>2}] [{ns_lbl:>22}] [values] "
-                f"msgs={len(msgs):<2} bt={len(bt):<2} last={last}"
-            )
+    elif mode == "values":
+        step += 1
+        msgs = chunk.get("messages", []) if isinstance(chunk, dict) else []
+        bt = chunk.get("backtest_results", []) if isinstance(chunk, dict) else []
+        last = _summarize_msg(msgs[-1]) if msgs else "-"
+        print(
+            f"[{step:>2}] [{ns_lbl:>22}] [values] "
+            f"msgs={len(msgs):<2} bt={len(bt):<2} last={last}"
+        )
 
-        elif mode == "messages":
-            msg_chunk, meta = chunk
-            kind = msg_chunk.__class__.__name__
-            if kind in ("AIMessageChunk", "AIMessage"):
-                content = msg_chunk.content
-                if isinstance(content, str):
-                    if content:
-                        print(content, end="", flush=True)
-                elif isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            print(block.get("text", ""), end="", flush=True)
-                for tc in getattr(msg_chunk, "tool_call_chunks", []) or []:
-                    if tc.get("name"):
-                        print(f"\n[tool_call] {tc['name']} args=", end="", flush=True)
-                    if tc.get("args"):
-                        print(tc["args"], end="", flush=True)
-            elif kind == "ToolMessage":
-                content = str(msg_chunk.content)
-                preview = content if len(content) <= 100 else content[:100] + "..."
-                print(f"\n[tool_res ] [{ns_lbl}] {msg_chunk.name} -> {preview}")
+    elif mode == "messages":
+        msg_chunk, meta = chunk
+        kind = msg_chunk.__class__.__name__
+        if kind in ("AIMessageChunk", "AIMessage"):
+            content = msg_chunk.content
+            if isinstance(content, str):
+                if content:
+                    print(content, end="", flush=True)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        print(block.get("text", ""), end="", flush=True)
+            for tc in getattr(msg_chunk, "tool_call_chunks", []) or []:
+                if tc.get("name"):
+                    print(f"\n[tool_call] {tc['name']} args=", end="", flush=True)
+                if tc.get("args"):
+                    print(tc["args"], end="", flush=True)
+        elif kind == "ToolMessage":
+            content = str(msg_chunk.content)
+            preview = content if len(content) <= 100 else content[:100] + "..."
+            print(f"\n[tool_res ] [{ns_lbl}] {msg_chunk.name} -> {preview}")
 
-        elif mode == "debug":
-            step += 1
-            kind = chunk.get("type", "?")
-            step_n = chunk.get("step", "?")
-            payload_inner = chunk.get("payload", {}) or {}
-            name = payload_inner.get("name", "")
-            print(
-                f"[{step:>3}] [{ns_lbl:>22}] [debug] "
-                f"type={kind:<13} step={step_n}  name={name}"
-            )
+    elif mode == "debug":
+        step += 1
+        kind = chunk.get("type", "?")
+        step_n = chunk.get("step", "?")
+        payload_inner = chunk.get("payload", {}) or {}
+        name = payload_inner.get("name", "")
+        print(
+            f"[{step:>3}] [{ns_lbl:>22}] [debug] "
+            f"type={kind:<13} step={step_n}  name={name}"
+        )
+
+    return step
+
+
+def _stream_sync(user_in: str, config: dict, mode: str) -> None:
+    """stream_mode in {updates, values, messages, debug} with subgraphs=True.
+
+    Handles `interrupt()` by detecting `__interrupt__` chunks in the stream:
+    when seen, the function prompts the user and resumes via
+    `Command(resume=...)`. The resume itself is another `agent.stream(...)`
+    call from the same checkpoint thread, so streaming output is contiguous.
+    """
+    payload = {"messages": [{"role": "user", "content": user_in}]}
+    step = 0
+    saw_interrupt = True   # enter the loop at least once
+
+    while saw_interrupt:
+        saw_interrupt = False
+        interrupt_value = None
+
+        for ns, chunk in agent.stream(
+            payload, config=config, stream_mode=mode, subgraphs=True
+        ):
+            # Interrupt signal: a special chunk keyed by "__interrupt__".
+            # Subgraph or not, we always exit the inner stream and ask
+            # for a resume value.
+            if isinstance(chunk, dict) and "__interrupt__" in chunk:
+                tup = chunk["__interrupt__"]
+                if tup:
+                    interrupt_value = tup[0].value
+                saw_interrupt = True
+                # Don't print the interrupt as a normal chunk; the prompt
+                # below shows what the human needs to decide.
+                continue
+
+            ns_lbl = _ns_label(ns)
+            step = _print_stream_chunk(ns_lbl, chunk, mode, step)
+
+        if saw_interrupt:
+            if mode == "messages":
+                print()   # close any pending typing line
+            print(_format_hitl_prompt(interrupt_value))
+            try:
+                reply = input("[hitl] reply> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                reply = "no: user aborted at HITL prompt"
+                print()
+            if not reply:
+                reply = "no: empty reply, defaulting to reject"
+            # Resume the paused graph. Command(resume=...) is the payload
+            # for the next stream() call; the graph reads it from the
+            # checkpoint and the interrupt() call returns this value.
+            payload = Command(resume=reply)
 
     if mode == "messages":
         print()
+
+
+def _format_hitl_prompt(iv) -> str:
+    """Render the interrupt payload as a short multi-line prompt."""
+    if isinstance(iv, dict):
+        return (
+            "\n[HITL] " + (iv.get("prompt") or "Approve?")
+            + f"\n       ticker  = {iv.get('ticker')!r}"
+            + f"\n       windows = {iv.get('windows')}"
+        )
+    return f"\n[HITL] {iv!r}"
 
 
 # Subgraph internal nodes whose start/end we want to surface in events mode.
 _SUBGRAPH_NODES = {"backtest_subgraph", "fetch", "sma", "score", "finalize"}
 
 
-async def _stream_events(user_in: str, config: dict) -> None:
-    """astream_events v2 — subgraph events nest automatically."""
-    payload = {"messages": [{"role": "user", "content": user_in}]}
+async def _drain_events(payload, config: dict) -> dict | None:
+    """Consume one round of astream_events. Returns the interrupt value
+    if the graph paused (so the caller can resume), or None when done."""
     streaming_text = False
+    interrupt_value: dict | None = None
 
     async for ev in agent.astream_events(payload, config=config, version="v2"):
         kind = ev["event"]
@@ -523,9 +685,54 @@ async def _stream_events(user_in: str, config: dict) -> None:
             print(f"[event] on_chain_start       name={name}")
         elif kind == "on_chain_end" and name in _SUBGRAPH_NODES:
             print(f"[event] on_chain_end         name={name}")
+        elif kind == "on_chain_end" and name == "human_approval":
+            # If this end event carries an interrupt, surface it.
+            output_obj = data.get("output")
+            if isinstance(output_obj, dict) and "__interrupt__" in output_obj:
+                tup = output_obj["__interrupt__"]
+                if tup:
+                    interrupt_value = tup[0].value
+            print(f"[event] on_chain_end         name=human_approval")
 
     if streaming_text:
         print()
+
+    # Interrupt may also surface via the snapshot — fall back to checking
+    # the current state's `next` field to be robust.
+    if interrupt_value is None:
+        snap = agent.get_state(config)
+        if snap.next and "human_approval" in snap.next:
+            for task in snap.tasks or ():
+                for iv in getattr(task, "interrupts", ()) or ():
+                    interrupt_value = iv.value
+                    break
+                if interrupt_value is not None:
+                    break
+
+    return interrupt_value
+
+
+async def _stream_events(user_in: str, config: dict) -> None:
+    """astream_events v2 — subgraph events nest automatically.
+
+    Handles `interrupt()` the same way as `_stream_sync`: drains events
+    until the round ends, then if the graph is paused at `human_approval`,
+    prompts the human and resumes via `Command(resume=...)`.
+    """
+    payload = {"messages": [{"role": "user", "content": user_in}]}
+    while True:
+        interrupt_value = await _drain_events(payload, config)
+        if interrupt_value is None:
+            break
+        print(_format_hitl_prompt(interrupt_value))
+        try:
+            reply = input("[hitl] reply> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            reply = "no: user aborted at HITL prompt"
+            print()
+        if not reply:
+            reply = "no: empty reply, defaulting to reject"
+        payload = Command(resume=reply)
 
 
 def _run_turn(user_in: str, config: dict, mode: str) -> None:
@@ -608,11 +815,12 @@ if __name__ == "__main__":
     pending_fork_prefix: str | None = None
     current_mode = "updates"
 
-    print("[init] CH05 — subgraph + parallel fan-out (Send)")
+    print("[init] CH06 — interrupt() HITL (human-in-the-loop)")
     print(f"[init] thread_id   = {thread_id}")
     print(f"[init] stream mode = {current_mode}  (try /mode for others)")
     print("[hint] try:")
     print("       比較 AAPL 的 SMA 20、50、100 三組策略")
+    print("       (the graph will pause at human_approval; reply 'yes' or 'no: ...')")
     print("[hint] commands:")
     print("       /mode [name]  show or switch stream mode")
     print(f"                     options: {', '.join(STREAM_MODES)}")
