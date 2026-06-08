@@ -17,8 +17,9 @@ LangGraph 教學專案 —— 每個 commit 對應一個章節，從第一個 `S
 - **CH03** — `InMemorySaver` checkpointer，每個 node 邊界自動存 state snapshot。多輪對話、`/history` 看 checkpoint 鏈、`/fork` 從任一歷史點 replay（time travel）
 - **CH04** — `agent.stream()` / `astream_events()`，五種 stream mode（updates / values / messages / debug / events）即時看圖內事件
 - **CH05** — Subgraph + `Send` API：`compare_strategies` 工具觸發 N 個 `backtest_subgraph` 平行 fan-out（fetch → sma → score 各自跑），`finalize` 把結果 fan-in 成一個 `ToolMessage`。自訂 reducer + `stream(subgraphs=True)` 看平行執行
+- **CH06** — `interrupt()` HITL：fan-out 前插入 `human_approval` node，graph 暫停等使用者批准 / 拒絕，`Command(resume=...)` 接續。拒絕路徑用 `ToolMessage` 餵 feedback 回 LLM、LLM 重新提案
 
-目標終局（規劃中）：`interrupt()` HITL 讓人類批准策略 code、`backtesting.py` 整合產出可執行回測腳本。
+目標終局（規劃中）：`backtesting.py` 整合產出可執行回測腳本。
 
 ---
 
@@ -62,7 +63,7 @@ python agent.py
 |------|------|
 | `get_price_data(ticker, days=30)` | 用 `md5(ticker\|days)` seed 的偽隨機 walk 產出 daily close。可重現、無外部 API |
 | `compute_sma(prices, window)` | 標準 SMA（window 內平均） |
-| `compare_strategies(ticker, windows)` *(CH05)* | LLM-only schema —— 實際執行被 conditional edge 攔截，fan-out 成 N 個 `backtest_subgraph` 分支跑「價格 vs SMA」交叉策略，回 per-window 的報酬率 / Sharpe / 交易次數 |
+| `compare_strategies(ticker, windows)` *(CH05)* | LLM-only schema —— 實際執行被 conditional edge 攔截，fan-out 成 N 個 `backtest_subgraph` 分支跑「價格 vs SMA」交叉策略，回 per-window 的報酬率 / Sharpe / 交易次數。CH06 起多了 `human_approval` HITL gate：fan-out 前先暫停問人類批准 |
 
 工具是教學用的最小可跑版本 —— 真實接 yfinance / 券商 API 是之後章節的事。重點在 graph 架構與 agent 行為，不在資料源。
 
@@ -88,13 +89,13 @@ README.md           # 你正在讀這個
 | `9680148` | **CH03** | `InMemorySaver` checkpointer → 多輪對話 + `/history` 看 checkpoint 鏈 + `/fork` time travel |
 | `1e35afb` | **CH04** | `stream()` / `astream_events()`，五種 stream mode、`/mode` 即時切換 |
 | `fdd2440` | **CH05** | Subgraph + `Send` API 平行 fan-out：`compare_strategies` 工具觸發 N 個 `backtest_subgraph`、`finalize` fan-in 成單一 `ToolMessage`、自訂 reducer、`subgraphs=True` 看平行執行 |
+| `0cc83b8` | **CH06** | `interrupt()` HITL：`human_approval` node 在 fan-out 前暫停 graph、`Command(resume=...)` 接續；拒絕路徑用 `ToolMessage` 餵 feedback 讓 LLM 重新提案；checkpoint 保留暫停點、可跨 process resume |
 
 照著讀的方式：`git checkout bd68c24` 看最簡單的版本（單節點圖），然後一路 `git log -p` 往新的 commit diff 過去，每個 chapter 都是一個明確、可獨立理解的概念加法。
 
 ### 規劃中
 
-- **CH06** — `interrupt()` HITL：策略 code 產出後暫停，等使用者批准才執行
-- **CH07** — `backtesting.py` 整合：LLM 產出 `Strategy` 子類 → 沙箱執行 → 回傳 metrics
+- **CH07** — `backtesting.py` 整合：LLM 產出 `Strategy` 子類 → 沙箱執行 → 回傳 metrics（HITL 沿用 CH06、執行前讓人類 review code）
 - **CH08** — 持久化 checkpointer（SQLite / Postgres）+ 跨 session 接續
 
 ---
