@@ -1,25 +1,27 @@
 # langgraph-strategy-agent
 
-LangGraph 教學專案 —— 每個 commit 對應一個章節，從第一個 `StateGraph` 一路堆到 streaming、checkpointer、time travel、HITL。題目用「AI 策略研究員」當載體：使用者描述策略想法 → LLM 用工具抓資料/算指標 → 之後接 `backtesting.py` 產 code → 跑回測 → 看結果迭代。
+> 🌐 **English** (you are reading) ・ [繁體中文](README.zh-TW.md)
 
-姊妹專案：[minimal-agent](https://github.com/codereindeer-dev/minimal-agent)（不用 framework，純 Anthropic SDK 從零寫的版本）。兩個專案題目相同（agent loop + tools + memory + HITL），對照著看可以清楚看出 framework 抽象帶來的取捨。
+A LangGraph teaching project —— each commit corresponds to one chapter, progressively building from the first `StateGraph` up through streaming, checkpointer, time travel, and HITL. The vehicle is an "AI strategy researcher": user describes a strategy idea → LLM uses tools to fetch data / compute indicators → eventually pipes through `backtesting.py` for code generation → runs backtest → iterates on results.
 
-> ⚠️ **這是教學 / 研究工具，不是投資建議**。LLM 產出的策略可能有 lookahead bias、overfit、其他問題；過去績效不代表未來。不要拿這些 code 直接上實盤。
+Sister project: [minimal-agent](https://github.com/codereindeer-dev/minimal-agent) (no framework, written from scratch with the raw Anthropic SDK). Both projects share the same scope (agent loop + tools + memory + HITL), so reading them side by side makes the framework's abstractions and their trade-offs concrete.
+
+> ⚠️ **This is a teaching / research tool, not investment advice**. LLM-generated strategies may suffer from lookahead bias, overfitting, and other problems; past performance does not predict future returns. Do not put any of this code on a live account.
 
 ---
 
-## 它是什麼
+## What it is
 
-一個 `agent.py`，每個 commit 是一個 LangGraph 概念的最小可跑版本：
+One `agent.py` file. Each commit is a minimal runnable version of one LangGraph concept:
 
-- **CH01** — 單節點 `StateGraph` + `TypedDict` + `add_messages` reducer
-- **CH02** — 加 `@tool` 工具（`get_price_data` / `compute_sma`，md5 seed 可重現）+ `tools_condition` 條件邊 + `tools → llm` 迴圈（ReAct loop）
-- **CH03** — `InMemorySaver` checkpointer，每個 node 邊界自動存 state snapshot。多輪對話、`/history` 看 checkpoint 鏈、`/fork` 從任一歷史點 replay（time travel）
-- **CH04** — `agent.stream()` / `astream_events()`，五種 stream mode（updates / values / messages / debug / events）即時看圖內事件
-- **CH05** — Subgraph + `Send` API：`compare_strategies` 工具觸發 N 個 `backtest_subgraph` 平行 fan-out（fetch → sma → score 各自跑），`finalize` 把結果 fan-in 成一個 `ToolMessage`。自訂 reducer + `stream(subgraphs=True)` 看平行執行
-- **CH06** — `interrupt()` HITL：fan-out 前插入 `human_approval` node，graph 暫停等使用者批准 / 拒絕，`Command(resume=...)` 接續。拒絕路徑用 `ToolMessage` 餵 feedback 回 LLM、LLM 重新提案
+- **CH01** — Single-node `StateGraph` + `TypedDict` + `add_messages` reducer
+- **CH02** — Add `@tool` tools (`get_price_data` / `compute_sma`, md5-seeded for reproducibility) + `tools_condition` conditional edge + `tools → llm` loop (ReAct loop)
+- **CH03** — `InMemorySaver` checkpointer; state snapshot auto-written at every node boundary. Multi-turn conversation, `/history` to view the checkpoint chain, `/fork` to replay from any historical point (time travel)
+- **CH04** — `agent.stream()` / `astream_events()`, five stream modes (updates / values / messages / debug / events) for real-time visibility into in-graph events
+- **CH05** — Subgraph + `Send` API: `compare_strategies` tool triggers N parallel `backtest_subgraph` fan-outs (each runs fetch → sma → score), `finalize` reduces fan-in results into a single `ToolMessage`. Custom reducer + `stream(subgraphs=True)` to surface parallel execution
+- **CH06** — `interrupt()` HITL: a `human_approval` node sits before fan-out, pausing the graph for user approval / rejection, then `Command(resume=...)` continues. Rejection path feeds feedback back to the LLM as a `ToolMessage` so the LLM can re-propose
 
-目標終局（規劃中）：`backtesting.py` 整合產出可執行回測腳本。
+End goal (planned): `backtesting.py` integration to emit runnable backtest scripts.
 
 ---
 
@@ -27,7 +29,7 @@ LangGraph 教學專案 —— 每個 commit 對應一個章節，從第一個 `S
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env   # 填入 ANTHROPIC_API_KEY
+cp .env.example .env   # fill in ANTHROPIC_API_KEY
 python agent.py
 ```
 
@@ -35,74 +37,75 @@ python agent.py
 
 ## REPL slash commands
 
-| 指令 | 作用 |
-|------|------|
-| `/mode [name]` | 顯示或切換 stream mode（`updates` / `values` / `messages` / `debug` / `events`） |
-| `/new` | 開新 `thread_id`（捨棄舊的對話歷史） |
-| `/history` | 列出目前 thread 的所有 checkpoint（短 id、next 節點、訊息數、最後一筆摘要） |
-| `/fork <ckpt>` | 下一則訊息從指定 checkpoint replay（time travel） |
-| `/exit` | 離開 |
+| Command | What it does |
+|---------|--------------|
+| `/mode [name]` | Show or switch stream mode (`updates` / `values` / `messages` / `debug` / `events`) |
+| `/new` | Start a new `thread_id` (discard previous conversation history) |
+| `/history` | List all checkpoints for the current thread (short id, next node, message count, last entry summary) |
+| `/fork <ckpt>` | Replay the next message from the specified checkpoint (time travel) |
+| `/exit` | Quit |
 
 ---
 
-## Stream modes（CH04）
+## Stream modes (CH04)
 
-| Mode | 看什麼 |
-|------|--------|
-| `updates` | 每個 node 執行完輸出 channel diff（預設、最常用） |
-| `values` | 每一步完整 state 快照 |
-| `messages` | LLM token 即時噴出，像打字動畫 |
-| `debug` | 圖內部事件：task start/end、checkpoint write |
-| `events` | `astream_events v2`：per-token + per-tool start/end，最細 |
-
----
-
-## 工具（mock）
-
-| Tool | 行為 |
-|------|------|
-| `get_price_data(ticker, days=30)` | 用 `md5(ticker\|days)` seed 的偽隨機 walk 產出 daily close。可重現、無外部 API |
-| `compute_sma(prices, window)` | 標準 SMA（window 內平均） |
-| `compare_strategies(ticker, windows)` *(CH05)* | LLM-only schema —— 實際執行被 conditional edge 攔截，fan-out 成 N 個 `backtest_subgraph` 分支跑「價格 vs SMA」交叉策略，回 per-window 的報酬率 / Sharpe / 交易次數。CH06 起多了 `human_approval` HITL gate：fan-out 前先暫停問人類批准 |
-
-工具是教學用的最小可跑版本 —— 真實接 yfinance / 券商 API 是之後章節的事。重點在 graph 架構與 agent 行為，不在資料源。
+| Mode | What you see |
+|------|--------------|
+| `updates` | Channel diff after each node runs (default, most common) |
+| `values` | Full state snapshot at every step |
+| `messages` | LLM tokens streamed live, like a typing animation |
+| `debug` | Graph-internal events: task start/end, checkpoint write |
+| `events` | `astream_events v2`: per-token + per-tool start/end, finest grain |
 
 ---
 
-## 專案結構
+## Tools (mock)
+
+| Tool | Behavior |
+|------|----------|
+| `get_price_data(ticker, days=30)` | Uses `md5(ticker\|days)` seeded pseudo-random walk to produce daily closes. Reproducible, no external API |
+| `compute_sma(prices, window)` | Standard SMA (mean over the window) |
+| `compare_strategies(ticker, windows)` *(CH05)* | LLM-only schema —— actual execution is intercepted by a conditional edge and fans out to N `backtest_subgraph` branches running a "price vs SMA" crossover strategy, returning per-window total return / Sharpe / number of trades. From CH06 onward this also goes through a `human_approval` HITL gate: the graph pauses for user approval before fan-out |
+
+Tools are minimal teaching-grade versions —— hooking up yfinance / broker APIs is a job for later chapters. The focus is graph architecture and agent behavior, not the data source.
+
+---
+
+## Project structure
 
 ```
-agent.py            # 全部邏輯，每個 commit 替換掉這份檔案
+agent.py            # All the logic; each commit replaces this file
 requirements.txt    # langgraph + langchain-anthropic + python-dotenv
-README.md           # 你正在讀這個
+README.md           # You are reading this (English)
+README.zh-TW.md     # 繁體中文版
 ```
 
 ---
 
-## Commit 演進
+## Commit evolution
 
-| Commit | 章節 | 加了什麼 |
-|--------|------|---------|
-| `ad8cb9d` | scaffold | requirements / .gitignore / README 骨架 |
-| `bd68c24` | **CH01** | 單節點 `StateGraph`：START → `llm` → END，`TypedDict` + `add_messages` reducer，stateless 單輪 |
-| `64628c7` | **CH02** | 加 ReAct loop：`@tool` 工具、`tools_condition` 條件邊、`tools → llm` 迴圈、Windows UTF-8 stdout fix |
-| `9680148` | **CH03** | `InMemorySaver` checkpointer → 多輪對話 + `/history` 看 checkpoint 鏈 + `/fork` time travel |
-| `1e35afb` | **CH04** | `stream()` / `astream_events()`，五種 stream mode、`/mode` 即時切換 |
-| `fdd2440` | **CH05** | Subgraph + `Send` API 平行 fan-out：`compare_strategies` 工具觸發 N 個 `backtest_subgraph`、`finalize` fan-in 成單一 `ToolMessage`、自訂 reducer、`subgraphs=True` 看平行執行 |
-| `0cc83b8` | **CH06** | `interrupt()` HITL：`human_approval` node 在 fan-out 前暫停 graph、`Command(resume=...)` 接續；拒絕路徑用 `ToolMessage` 餵 feedback 讓 LLM 重新提案；checkpoint 保留暫停點、可跨 process resume |
+| Commit | Chapter | What was added |
+|--------|---------|----------------|
+| `ad8cb9d` | scaffold | requirements / .gitignore / README skeleton |
+| `bd68c24` | **CH01** | Single-node `StateGraph`: START → `llm` → END, `TypedDict` + `add_messages` reducer, stateless single-turn |
+| `64628c7` | **CH02** | Add ReAct loop: `@tool` tools, `tools_condition` conditional edge, `tools → llm` loop, Windows UTF-8 stdout fix |
+| `9680148` | **CH03** | `InMemorySaver` checkpointer → multi-turn conversation + `/history` to view checkpoint chain + `/fork` time travel |
+| `1e35afb` | **CH04** | `stream()` / `astream_events()`, five stream modes, `/mode` to switch live |
+| `fdd2440` | **CH05** | Subgraph + `Send` API parallel fan-out: `compare_strategies` triggers N `backtest_subgraph` invocations, `finalize` fans them in to a single `ToolMessage`, custom reducer, `subgraphs=True` to see parallel execution |
+| `0cc83b8` | **CH06** | `interrupt()` HITL: `human_approval` node pauses the graph before fan-out, `Command(resume=...)` continues; rejection path uses `ToolMessage` to feed feedback back so the LLM re-proposes; checkpoint preserves the pause point and supports cross-process resume |
 
-照著讀的方式：`git checkout bd68c24` 看最簡單的版本（單節點圖），然後一路 `git log -p` 往新的 commit diff 過去，每個 chapter 都是一個明確、可獨立理解的概念加法。
+How to read along: `git checkout bd68c24` for the simplest version (single-node graph), then walk forward with `git log -p` chapter by chapter. Each commit is a single, independently understandable conceptual addition.
 
-### 規劃中
+### Planned
 
-- **CH07** — `backtesting.py` 整合：LLM 產出 `Strategy` 子類 → 沙箱執行 → 回傳 metrics（HITL 沿用 CH06、執行前讓人類 review code）
-- **CH08** — 持久化 checkpointer（SQLite / Postgres）+ 跨 session 接續
+- **CH07** — `backtesting.py` integration: LLM produces a `Strategy` subclass → sandbox execution → return metrics (HITL from CH06 carries forward, so the user reviews code before it runs)
+- **CH08** — Persistent checkpointer (SQLite / Postgres) + cross-session resume
 
 ---
 
-## 適合誰讀
+## Who this is for
 
-- 已經理解 agent loop 的基本概念（建議先看 [minimal-agent](https://github.com/codereindeer-dev/minimal-agent)）
-- 想知道 LangGraph 多給了什麼：checkpoint、time travel、stream mode、subgraph、`interrupt()` HITL
-- 已經有 Python 基礎、看得懂回測概念（不需要會寫策略，AI 會寫；但要看得懂 code）
-- 想看 framework 抽象帶來的 trade-off：對照 minimal-agent 同樣功能要手寫多少
+- You already understand the basic agent loop concept (recommend reading [minimal-agent](https://github.com/codereindeer-dev/minimal-agent) first)
+- You want to know what LangGraph adds: checkpoint, time travel, stream modes, subgraphs, `interrupt()` HITL
+- You have Python fluency and can read backtest code (you don't need to write strategies —— the AI does that —— but you do need to read the code)
+- You want to see the trade-offs of framework abstraction: comparing minimal-agent's hand-written approach against the same functionality in LangGraph
